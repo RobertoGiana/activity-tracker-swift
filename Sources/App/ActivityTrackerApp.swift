@@ -30,16 +30,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
-        
+
         // Richiedi permessi Accessibility
         PermissionsService.shared.requestAccessibilityPermissions()
-        
+
+        // Purge attività più vecchie di 90 giorni in background
+        DispatchQueue.global(qos: .utility).async {
+            _ = DatabaseService.shared.purgeOldActivities(olderThanDays: 90)
+        }
+
         // Avvia il monitoraggio attività
         ActivityMonitor.shared.startMonitoring()
-        
+
         // Avvia il monitoraggio call (Teams, Zoom, etc.)
         CallDetector.shared.startMonitoring()
-        
+
         print("✅ Activity Tracker avviato!")
     }
     

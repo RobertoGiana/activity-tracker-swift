@@ -13,6 +13,7 @@ class ActivityMonitor: ObservableObject {
     private var lastWindowInfo: WindowInfo?
     private let pollInterval: TimeInterval = 2.0 // 2 secondi
     private let idleThreshold: TimeInterval = 5 * 60 // 5 minuti
+    private let minActivityDurationToKeep: Int = 3 // Sotto i 3s = rumore, droppata alla chiusura
     
     /// Timestamp dell'ultima attività utente rilevata (cambio finestra o input)
     private var lastUserActivityTime: Date = Date()
@@ -88,13 +89,9 @@ class ActivityMonitor: ObservableObject {
             let now = Date()
             activity.durationSeconds = Int(now.timeIntervalSince(activity.startTime))
             activity.updatedAt = now
-            
+
             db.updateActivity(activity)
-            
-            // Ricarica attività aggiornata
-            if let id = activity.id {
-                currentActivity = db.getActivityById(id)
-            }
+            currentActivity = activity
         }
     }
     
@@ -160,8 +157,12 @@ class ActivityMonitor: ObservableObject {
         activity.endTime = clampedEndTime
         activity.durationSeconds = Int(clampedEndTime.timeIntervalSince(activity.startTime))
         activity.updatedAt = Date()
-        
-        db.updateActivity(activity)
+
+        if activity.durationSeconds < minActivityDurationToKeep, let activityId = activity.id {
+            db.deleteActivity(activityId)
+        } else {
+            db.updateActivity(activity)
+        }
         currentActivity = nil
     }
     

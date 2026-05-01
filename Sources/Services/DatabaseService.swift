@@ -56,10 +56,16 @@ class DatabaseService {
         do {
             let path = getDBPath()
             print("📁 Database path: \(path)")
-            
+
             db = try Connection(path)
+            try db?.execute("PRAGMA journal_mode=WAL;")
+            try db?.execute("PRAGMA synchronous=NORMAL;")
+            try db?.execute("PRAGMA temp_store=MEMORY;")
+            try db?.execute("PRAGMA mmap_size=268435456;")
+            try db?.execute("PRAGMA cache_size=-16384;") // 16MB di page cache
             createTables()
-            print("✅ Database inizializzato")
+            try? db?.execute("PRAGMA optimize;")
+            print("✅ Database inizializzato (WAL)")
         } catch {
             print("❌ Errore inizializzazione database: \(error)")
         }
@@ -140,6 +146,7 @@ class DatabaseService {
             try db.run(activities.createIndex(startTime, ifNotExists: true))
             try db.run(activities.createIndex(category, ifNotExists: true))
             try db.run(activities.createIndex(appName, ifNotExists: true))
+            try db.run(activities.createIndex(appBundleId, startTime, ifNotExists: true))
             
             print("✅ Tabelle create")
         } catch {
@@ -175,6 +182,16 @@ class DatabaseService {
         }
     }
     
+    func deleteActivity(_ activityId: Int64) {
+        guard let db = db else { return }
+        do {
+            let row = activities.filter(id == activityId)
+            try db.run(row.delete())
+        } catch {
+            print("❌ Errore eliminazione attività: \(error)")
+        }
+    }
+
     func updateActivity(_ activity: Activity) {
         guard let db = db, let activityId = activity.id else { return }
         
@@ -263,18 +280,22 @@ class DatabaseService {
         return nil
     }
     
-    /// Cerca attività che contengono le keywords nel titolo, filtrando via SQL per bundleId
+    /// Cerca attività che contengono le keywords nel titolo, tutto via SQL
     func getActivitiesMatchingKeywords(_ keywords: [String], bundleId: String? = nil) -> [Activity] {
         guard let db = db, !keywords.isEmpty else { return [] }
-        
+
         do {
-            // Filtra per bundleId a livello SQL se specificato (usa parametro sicuro)
             var query = activities.order(startTime.desc)
             if let bundle = bundleId {
                 query = query.filter(appBundleId.like("%\(bundle)%"))
             }
-            
-            let filteredActivities = try db.prepare(query).map { row in
+            // Tutte le keyword devono matchare activity_name o window_title (SQLite LIKE è case-insensitive su ASCII)
+            for keyword in keywords {
+                let pattern = "%\(keyword)%"
+                query = query.filter(activityName.like(pattern) || windowTitle.like(pattern))
+            }
+
+            return try db.prepare(query).map { row in
                 Activity(
                     id: row[id],
                     appName: row[appName],
@@ -289,16 +310,6 @@ class DatabaseService {
                     createdAt: Date(timeIntervalSince1970: row[createdAt]),
                     updatedAt: Date(timeIntervalSince1970: row[updatedAt])
                 )
-            }
-            
-            // Filtra per keywords in Swift (LIKE multipli in SQLite.swift sono complessi)
-            return filteredActivities.filter { activity in
-                let activityLower = activity.activityName.lowercased()
-                let titleLower = activity.windowTitle.lowercased()
-                
-                return keywords.allSatisfy { keyword in
-                    activityLower.contains(keyword.lowercased()) || titleLower.contains(keyword.lowercased())
-                }
             }
         } catch {
             print("❌ Errore ricerca attività: \(error)")
@@ -637,34 +648,42 @@ class DatabaseService {
         components.year = year
         components.month = month
         components.day = 1
-        
+
         guard let startOfMonth = calendar.date(from: components),
               let range = calendar.range(of: .day, in: .month, for: startOfMonth) else {
             return []
         }
-        
+
         let endOfMonth = calendar.date(byAdding: .month, value: 1, to: startOfMonth)!
-        
+
         // Carica tutte le ferie e workDays del mese
         let monthDaysOff = getDaysOff(year: year, month: month)
         let monthWorkDays = getWorkDays(year: year, month: month)
-        
+
+        // Index per accesso O(1) per giorno (timestamp di startOfDay)
+        var daysOffByTs: [TimeInterval: DayOff] = [:]
+        for d in monthDaysOff { daysOffByTs[calendar.startOfDay(for: d.date).timeIntervalSince1970] = d }
+        var workDaysByTs: [TimeInterval: WorkDay] = [:]
+        for w in monthWorkDays { workDaysByTs[calendar.startOfDay(for: w.date).timeIntervalSince1970] = w }
+
         // SINGOLA query per tutte le attività del mese
         let allMonthActivities = getActivities(startDate: startOfMonth, endDate: endOfMonth)
-        
+
         // Partiziona le attività per giorno
         var activitiesByDay: [Int: [Activity]] = [:]
+        activitiesByDay.reserveCapacity(range.count)
         for activity in allMonthActivities {
             let day = calendar.component(.day, from: activity.startTime)
             activitiesByDay[day, default: []].append(activity)
         }
-        
+
         var result: [CalendarDayData] = []
-        
+        result.reserveCapacity(range.count)
+
         for day in range {
             components.day = day
             guard let date = calendar.date(from: components) else { continue }
-            
+
             let dayActivities = activitiesByDay[day] ?? []
             
             // Calcola tempo attivo escludendo attività di sistema
@@ -689,20 +708,15 @@ class DatabaseService {
                 .filter { $0.category == .leisure }
                 .reduce(0) { $0 + $1.durationSeconds }
             
-            // Trova se c'è un giorno di ferie
-            let dayOff = monthDaysOff.first { 
-                calendar.isDate($0.date, inSameDayAs: date) 
-            }
-            
-            // Trova personalizzazioni workDay
-            let workDay = monthWorkDays.first {
-                calendar.isDate($0.date, inSameDayAs: date)
-            }
+            // Lookup O(1) per ferie e workDay tramite timestamp di startOfDay
+            let dayKey = calendar.startOfDay(for: date).timeIntervalSince1970
+            let dayOff = daysOffByTs[dayKey]
+            let workDay = workDaysByTs[dayKey]
             
             // Verifica se è un festivo
             let holiday = HolidayService.isHoliday(date)
             
-            result.append(CalendarDayData(
+            var dayData = CalendarDayData(
                 date: date,
                 workSeconds: workSeconds,
                 leisureSeconds: leisureSeconds,
@@ -713,9 +727,16 @@ class DatabaseService {
                 calculatedPresenceSeconds: activeSeconds,
                 cachedFirstDaytimeStart: Self.computeFirstDaytimeStart(date: date, activities: dayActivities),
                 cachedNightTailWorkSeconds: Self.computeNightTailWorkSeconds(date: date, activities: dayActivities)
-            ))
+            )
+            // Pre-calcola le proprietà più chiamate dalla View per evitare iterazioni a ogni rebuild
+            dayData.cachedPresenceSeconds = dayData.presenceSeconds
+            dayData.cachedDayStartTime = dayData.startTime
+            dayData.cachedDayEndTime = dayData.endTime
+            dayData.cachedPresenceRange = dayData.presenceRange
+            dayData.cachedOvertimeSeconds = dayData.overtimeSeconds
+            result.append(dayData)
         }
-        
+
         return result
     }
     

@@ -5,8 +5,11 @@ import Combine
 class ActivityStore: ObservableObject {
     static let shared = ActivityStore()
     
-    @Published var activities: [Activity] = []
+    @Published var activities: [Activity] = [] {
+        didSet { rebuildGroupedActivities() }
+    }
     @Published var calendarData: [CalendarDayData] = []
+    @Published private(set) var cachedGroupedActivities: [GroupedActivity] = []
     @Published var patterns: [Pattern] = []
     @Published var classifications: [Classification] = []
     @Published var selectedDate: Date = Date()
@@ -19,22 +22,25 @@ class ActivityStore: ObservableObject {
     private var interactionTimer: Timer?
     
     private let db = DatabaseService.shared
+    private let dbQueue = DispatchQueue(label: "com.robertogiana.ActivityTracker.db", qos: .userInitiated)
     private var cancellables = Set<AnyCancellable>()
     private var calendarRefreshCounter: Int = 0
+    private var calendarCacheKey: String?
+    private var calendarCacheLastBuilt: Date = .distantPast
+    private let calendarCacheTTL: TimeInterval = 60
     
     private init() {
         // Carica dati iniziali
         refreshAll()
         
-        // Aggiorna ogni 5 secondi (meno aggressivo) solo se non sta interagendo
-        Timer.publish(every: 5.0, on: .main, in: .common)
+        // Refresh attività ogni 15s; calendario ogni 5 minuti (20 cicli)
+        Timer.publish(every: 15.0, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
                 guard let self = self, !self.isUserInteracting else { return }
                 self.refreshActivities()
-                // Aggiorna il calendario solo ogni 6 cicli (30 secondi) per ridurre il carico
                 self.calendarRefreshCounter += 1
-                if self.calendarRefreshCounter >= 6 {
+                if self.calendarRefreshCounter >= 20 {
                     self.calendarRefreshCounter = 0
                     self.refreshCalendarData()
                 }
@@ -70,13 +76,37 @@ class ActivityStore: ObservableObject {
         activities = db.getActivities(startDate: startOfDay, endDate: endOfDay)
     }
     
-    /// Aggiorna i dati del calendario
-    func refreshCalendarData() {
+    /// Aggiorna i dati del calendario in background (cache in-memory con TTL 60s + invalidazione esplicita)
+    func refreshCalendarData(force: Bool = false) {
         let calendar = Calendar.current
         let year = calendar.component(.year, from: currentMonth)
         let month = calendar.component(.month, from: currentMonth)
-        
-        calendarData = db.getCalendarData(year: year, month: month)
+        let key = "\(year)-\(month)"
+        let now = Date()
+        let isFresh = calendarCacheKey == key
+            && now.timeIntervalSince(calendarCacheLastBuilt) < calendarCacheTTL
+            && !calendarData.isEmpty
+        if !force && isFresh {
+            return
+        }
+
+        let targetMonth = currentMonth
+        dbQueue.async { [weak self] in
+            guard let self = self else { return }
+            let data = self.db.getCalendarData(year: year, month: month)
+            DispatchQueue.main.async {
+                // Drop result se nel frattempo l'utente ha cambiato mese
+                guard self.currentMonth == targetMonth else { return }
+                self.calendarData = data
+                self.calendarCacheKey = key
+                self.calendarCacheLastBuilt = Date()
+            }
+        }
+    }
+
+    private func invalidateCalendarCache() {
+        calendarCacheKey = nil
+        calendarCacheLastBuilt = .distantPast
     }
     
     /// Aggiorna i pattern
@@ -140,10 +170,11 @@ class ActivityStore: ObservableObject {
         
         // Invalida la cache del PatternMatcher
         PatternMatcher.shared.invalidateCache()
-        
+        invalidateCalendarCache()
+
         refreshAll()
     }
-    
+
     /// Classifica un'intera app (tutte le attività)
     func classifyApp(bundleId: String, appName: String, category: ActivityCategory, generalizedName: String?) {
         // Aggiorna tutte le attività esistenti di questa app
@@ -166,10 +197,11 @@ class ActivityStore: ObservableObject {
         
         // Invalida la cache del PatternMatcher
         PatternMatcher.shared.invalidateCache()
-        
+        invalidateCalendarCache()
+
         refreshAll()
     }
-    
+
     /// Aggiunge un nuovo pattern
     func addPattern(_ pattern: Pattern) {
         _ = db.insertPattern(pattern)
@@ -186,6 +218,7 @@ class ActivityStore: ObservableObject {
     func changeMonth(by months: Int) {
         if let newMonth = Calendar.current.date(byAdding: .month, value: months, to: currentMonth) {
             currentMonth = newMonth
+            invalidateCalendarCache()
             refreshCalendarData()
         }
     }
@@ -196,22 +229,26 @@ class ActivityStore: ObservableObject {
         refreshActivities()
     }
     
-    /// Attività raggruppate per nome
+    /// Attività raggruppate per nome (memoizzato — ricalcolato solo quando `activities` cambia)
     var groupedActivities: [GroupedActivity] {
+        cachedGroupedActivities
+    }
+
+    private func rebuildGroupedActivities() {
         let grouped = Dictionary(grouping: activities) { $0.displayName }
-        return grouped.map { name, activities in
-            let totalDuration = activities.reduce(0) { $0 + $1.durationSeconds }
-            let category = activities.first?.category
-            let appName = activities.first?.appName ?? ""
-            let lastActivity = activities.max(by: { $0.startTime < $1.startTime })
+        cachedGroupedActivities = grouped.map { name, acts in
+            let totalDuration = acts.reduce(0) { $0 + $1.durationSeconds }
+            let category = acts.first?.category
+            let appName = acts.first?.appName ?? ""
+            let lastActivity = acts.max(by: { $0.startTime < $1.startTime })
             return GroupedActivity(
                 name: name,
                 appName: appName,
                 category: category,
                 totalDuration: totalDuration,
-                count: activities.count,
+                count: acts.count,
                 lastStartTime: lastActivity?.startTime ?? Date(),
-                activities: activities
+                activities: acts
             )
         }.sorted { $0.lastStartTime > $1.lastStartTime }
     }
@@ -225,17 +262,35 @@ class ActivityStore: ObservableObject {
     
     // MARK: - Days Off (Ferie, Permessi, etc.)
     
-    /// Aggiunge un giorno di assenza
+    /// Aggiunge un giorno di assenza (optimistic + DB in background)
     func addDayOff(date: Date, type: DayOffType, note: String? = nil) {
         let dayOff = DayOff(date: date, type: type, note: note)
-        _ = db.insertDayOff(dayOff)
-        refreshCalendarData()
+        if let idx = calendarData.firstIndex(where: { Calendar.current.isDate($0.date, inSameDayAs: date) }) {
+            calendarData[idx].dayOff = dayOff
+        }
+        dbQueue.async { [weak self] in
+            guard let self = self else { return }
+            _ = self.db.insertDayOff(dayOff)
+            DispatchQueue.main.async {
+                self.invalidateCalendarCache()
+                self.refreshCalendarData(force: true)
+            }
+        }
     }
-    
-    /// Rimuove un giorno di assenza
+
+    /// Rimuove un giorno di assenza (optimistic + DB in background)
     func removeDayOff(date: Date) {
-        db.deleteDayOff(date)
-        refreshCalendarData()
+        if let idx = calendarData.firstIndex(where: { Calendar.current.isDate($0.date, inSameDayAs: date) }) {
+            calendarData[idx].dayOff = nil
+        }
+        dbQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.db.deleteDayOff(date)
+            DispatchQueue.main.async {
+                self.invalidateCalendarCache()
+                self.refreshCalendarData(force: true)
+            }
+        }
     }
     
     /// Ottiene il giorno di assenza per una data
@@ -251,14 +306,27 @@ class ActivityStore: ObservableObject {
     // MARK: - Work Days (Personalizzazioni giornata)
     
     /// Salva/aggiorna le personalizzazioni di un giorno lavorativo
+    /// Optimistic update sul giorno modificato per feedback UI istantaneo, poi DB write + refresh in background
     func saveWorkDay(date: Date, customStartTime: String?, vacationHours: Int) {
         let workDay = WorkDay(
             date: date,
             customStartTime: customStartTime,
             vacationHours: vacationHours
         )
-        db.upsertWorkDay(workDay)
-        refreshCalendarData()
+
+        // Aggiornamento ottimistico in-memory: la UI mostra subito la nuova ora
+        if let idx = calendarData.firstIndex(where: { Calendar.current.isDate($0.date, inSameDayAs: date) }) {
+            calendarData[idx].workDay = workDay
+        }
+
+        dbQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.db.upsertWorkDay(workDay)
+            DispatchQueue.main.async {
+                self.invalidateCalendarCache()
+                self.refreshCalendarData(force: true)
+            }
+        }
     }
     
     /// Ottiene le personalizzazioni per una data

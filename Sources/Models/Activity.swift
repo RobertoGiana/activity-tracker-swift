@@ -194,6 +194,12 @@ struct CalendarDayData: Identifiable {
     var cachedFirstDaytimeStart: Date? = nil
     /// Pre-calcolato: secondi di lavoro nella fascia notturna 0:00-5:00
     var cachedNightTailWorkSeconds: Int = 0
+    /// Pre-calcolati per evitare iterazioni di `activities` in computed property chiamate dalla View
+    var cachedPresenceSeconds: Int? = nil
+    var cachedDayStartTime: Date? = nil
+    var cachedDayEndTime: Date? = nil
+    var cachedPresenceRange: (start: Date, end: Date)? = nil
+    var cachedOvertimeSeconds: Int? = nil
     
     // MARK: - System Activity Exclusion
     
@@ -332,6 +338,7 @@ struct CalendarDayData: Identifiable {
     
     /// Ore di straordinario (attività "Lavoro" FUORI dalla fascia inizio-fine standard)
     var overtimeSeconds: Int {
+        if let cached = cachedOvertimeSeconds { return cached }
         let calendar = Calendar.current
         let dayStart = calendar.startOfDay(for: date)
         let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart)!
@@ -423,6 +430,7 @@ struct CalendarDayData: Identifiable {
     /// Ore di presenza (somma durate attività che INTERSECANO il giorno, ESCLUDE attività di sistema)
     /// Le attività che attraversano mezzanotte vengono splittate
     var presenceSeconds: Int {
+        if let cached = cachedPresenceSeconds { return cached }
         let calendar = Calendar.current
         let dayStart = calendar.startOfDay(for: date)
         let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart)!
@@ -455,6 +463,7 @@ struct CalendarDayData: Identifiable {
     
     /// Range presenza (da prima a ultima attività che INTERSECA il giorno, ESCLUDE attività di sistema e call in background)
     var presenceRange: (start: Date, end: Date)? {
+        if let cached = cachedPresenceRange { return cached }
         let calendar = Calendar.current
         let dayStart = calendar.startOfDay(for: date)
         let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart)!
@@ -501,6 +510,7 @@ struct CalendarDayData: Identifiable {
     
     /// Ora di inizio lavoro (prima attività utente del giorno, esclude attività di sistema e call)
     var startTime: Date? {
+        if let cached = cachedDayStartTime { return cached }
         let calendar = Calendar.current
         let dayStart = calendar.startOfDay(for: date)
         let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart)!
@@ -514,6 +524,7 @@ struct CalendarDayData: Identifiable {
     
     /// Ora di fine lavoro (ultima attività utente del giorno, esclude attività di sistema e call)
     var endTime: Date? {
+        if let cached = cachedDayEndTime { return cached }
         let calendar = Calendar.current
         let dayStart = calendar.startOfDay(for: date)
         let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart)!
